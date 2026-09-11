@@ -1,6 +1,8 @@
 import argparse
+import json
 import sys
-from collections import Counter
+import time
+from collections import Counter, deque
 
 from rich.console import Console
 from rich.table import Table
@@ -14,7 +16,7 @@ PROTOCOLS = {1: "ICMP", 6: "TCP", 17: "UDP"}
 # TCP标志位字母 → 全名
 FLAG_NAMES = {"S": "SYN", "A": "ACK", "P": "PSH", "F": "FIN", "R": "RST", "U": "URG"}
 
-# 同一来源触碰的不同端口数达到该值，判定为疑似扫描
+# 窗口时间内同一来源触碰的不同端口数达到该值，判定为疑似扫描
 SCAN_THRESHOLD = 10
 
 
@@ -33,16 +35,52 @@ def find_iface(keyword):
     return None
 
 
+class ScanTracker:
+    """滑动时间窗口内统计每个来源触碰过的不同端口，超阈值就告警一次"""
+
+    def __init__(self, window, label):
+        self.window = window
+        self.label = label
+        # {(源IP, 目的IP): deque([(时间戳, 端口), ...])}，只留窗口内的记录
+        self.touches = {}
+        # 触发过的告警事件，最后写进报告
+        self.alerts = []
+
+    def touch(self, src, dst, port):
+        now = time.time()
+        hits = self.touches.setdefault((src, dst), deque())
+        hits.append((now, port))
+
+        # 新包来了先把窗口外的旧记录挤出去，再数剩下的
+        while hits and now - hits[0][0] > self.window:
+            hits.popleft()
+
+        distinct = {port for _, port in hits}
+        if len(distinct) >= SCAN_THRESHOLD:
+            span = round(now - hits[0][0], 1)
+            self.alerts.append({
+                "src": src,
+                "dst": dst,
+                "distinct_ports": len(distinct),
+                "within_seconds": span,
+            })
+            console.print(
+                f"\n[bold red][!] 疑似{self.label}扫描：{src} 在 {span} 秒内触碰了 "
+                f"{dst} 的 {len(distinct)} 个不同端口[/bold red]\n"
+            )
+            # 清空重新计数，同一波扫描不重复刷屏
+            hits.clear()
+
+
 class TrafficAnalyzer:
-    def __init__(self):
+    def __init__(self, window):
         self.total = 0
         self.protocols = Counter()
         self.connections = Counter()
         self.no_ip = 0
-        # {(源IP, 目的IP): 该来源SYN触碰过的目的端口集合}
-        self.syn_ports = {}
-        # 已告警的扫描来源 → 对应端口集合（引用，持续增长）
-        self.scanners = {}
+        # TCP 和 UDP 分开跟踪，指纹不一样
+        self.syn_tracker = ScanTracker(window, "TCP SYN")
+        self.udp_tracker = ScanTracker(window, "UDP")
 
     def process_packet(self, pkt):
         self.total += 1
@@ -61,19 +99,14 @@ class TrafficAnalyzer:
 
             # 端口扫描指纹：纯SYN（无ACK）打向大量不同端口
             if "S" in flags and "A" not in flags:
-                ports = self.syn_ports.setdefault((ip.src, ip.dst), set())
-                ports.add(tcp.dport)
-                if len(ports) >= SCAN_THRESHOLD and ip.src not in self.scanners:
-                    self.scanners[ip.src] = ports
-                    console.print(
-                        f"\n[bold red][!] 疑似端口扫描：{ip.src} 正在触碰 "
-                        f"{ip.dst} 的 {len(ports)} 个不同端口[/bold red]\n"
-                    )
+                self.syn_tracker.touch(ip.src, ip.dst, tcp.dport)
         elif UDP in pkt:
             udp = pkt[UDP]
             self.protocols["UDP"] += 1
             self.connections[f"{ip.src} > {ip.dst}:{udp.dport}"] += 1
             print(f"{ip.src}:{udp.sport} > {ip.dst}:{udp.dport}  UDP")
+            # UDP没有握手，只能按短时间触碰大量不同端口来判
+            self.udp_tracker.touch(ip.src, ip.dst, udp.dport)
         else:
             self.protocols[PROTOCOLS.get(ip.proto, "其他")] += 1
 
@@ -94,12 +127,29 @@ class TrafficAnalyzer:
         for target, count in self.connections.most_common(10):
             console.print(f"  {target}  ({count} 包)")
 
-        if self.scanners:
+        report = {
+            "total_packets": self.total,
+            "protocols": dict(self.protocols),
+            "no_ip_packets": self.no_ip,
+            "top_connections": [
+                {"target": t, "packets": c} for t, c in self.connections.most_common(10)
+            ],
+            "tcp_syn_scan_alerts": self.syn_tracker.alerts,
+            "udp_scan_alerts": self.udp_tracker.alerts,
+        }
+
+        alerts = self.syn_tracker.alerts + self.udp_tracker.alerts
+        if alerts:
             console.print("\n[bold red]检测到疑似端口扫描：[/bold red]")
-            for src, ports in self.scanners.items():
-                console.print(f"  来源 {src} 在抓包期间触碰了 {len(ports)} 个不同端口")
+            for a in alerts:
+                console.print(
+                    f"  来源 {a['src']} 在 {a['within_seconds']} 秒内触碰了 "
+                    f"{a['dst']} 的 {a['distinct_ports']} 个不同端口"
+                )
         else:
             console.print("\n[green]未检测到端口扫描行为[/green]")
+
+        return report
 
 
 if __name__ == "__main__":
@@ -107,6 +157,8 @@ if __name__ == "__main__":
     parser.add_argument("-i", "--iface", help="监听的网卡关键词，如 loopback；默认自动选择", default=None)
     parser.add_argument("-c", "--count", type=int, default=50, help="抓包数量，默认50")
     parser.add_argument("-t", "--timeout", type=int, default=None, help="超时秒数，到时自动停止")
+    parser.add_argument("-w", "--window", type=int, default=10, help="扫描检测的时间窗口秒数，默认10")
+    parser.add_argument("-o", "--output", help="把统计报告导出成 JSON 文件，如 report.json", default=None)
     args = parser.parse_args()
 
     iface = None
@@ -116,7 +168,12 @@ if __name__ == "__main__":
             console.print(f"[red]找不到匹配 '{args.iface}' 的网卡[/red]")
             sys.exit(1)
 
-    analyzer = TrafficAnalyzer()
+    analyzer = TrafficAnalyzer(window=args.window)
     print("开始抓包...")
     sniff(iface=iface, prn=analyzer.process_packet, count=args.count, timeout=args.timeout)
-    analyzer.show_report()
+    report = analyzer.show_report()
+
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        console.print(f"\n[bold blue]报告已导出到 {args.output}[/bold blue]")
