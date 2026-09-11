@@ -95,7 +95,7 @@ class TrafficAnalyzer:
             self.protocols["TCP"] += 1
             self.connections[f"{ip.src} > {ip.dst}:{tcp.dport}"] += 1
             flags = str(tcp.flags)
-            print(f"{ip.src}:{tcp.sport} > {ip.dst}:{tcp.dport}  TCP  标志: {parse_flags(tcp.flags)}")
+            print(f"{ip.src}:{tcp.sport} > {ip.dst}:{tcp.dport}  TCP  标志: {parse_flags(tcp.flags)} SEQ  序列号：{tcp.seq} ACK  序列号：{tcp.ack}")
 
             # 端口扫描指纹：纯SYN（无ACK）打向大量不同端口
             if "S" in flags and "A" not in flags:
@@ -159,6 +159,7 @@ if __name__ == "__main__":
     parser.add_argument("-t", "--timeout", type=int, default=None, help="超时秒数，到时自动停止")
     parser.add_argument("-w", "--window", type=int, default=10, help="扫描检测的时间窗口秒数，默认10")
     parser.add_argument("-o", "--output", help="把统计报告导出成 JSON 文件，如 report.json", default=None)
+    parser.add_argument("-f", "--filter", help="抓包过滤条件，如 'tcp port 8000'、'udp port 53'", default=None)
     args = parser.parse_args()
 
     iface = None
@@ -170,7 +171,7 @@ if __name__ == "__main__":
 
     analyzer = TrafficAnalyzer(window=args.window)
     print("开始抓包...")
-    sniff(iface=iface, prn=analyzer.process_packet, count=args.count, timeout=args.timeout)
+    sniff(iface=iface, prn=analyzer.process_packet, count=args.count, timeout=args.timeout, filter=args.filter)
     report = analyzer.show_report()
 
     if args.output:
